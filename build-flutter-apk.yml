@@ -1,0 +1,56 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find project folder (pubspec.yaml)
+        id: proj
+        run: |
+          P=$(find . -name pubspec.yaml -not -path "./.git/*" | head -1)
+          if [ -z "$P" ]; then
+            for z in $(find . -name "*.zip" -not -path "./.git/*"); do unzip -o "$z" -d "$(dirname "$z")"; done
+            P=$(find . -name pubspec.yaml -not -path "./.git/*" | head -1)
+          fi
+          if [ -z "$P" ]; then echo "pubspec.yaml nahi mila - files upload karo"; exit 1; fi
+          echo "Project folder: $(dirname "$P")"
+          echo "dir=$(dirname "$P")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.50.1'
+          channel: stable
+          cache: true
+
+      - name: Prepare Android project
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          flutter create --platforms android --org com.ira --project-name ira_service_desk .
+          rm -rf test
+          K=android/app/src/main/kotlin/com/ira/ira_service_desk
+          mkdir -p lib "$K"
+          for f in main.dart core.dart phone.dart; do if [ -f "$f" ]; then cp "$f" lib/; fi; done
+          for f in MainActivity.kt CallReceiver.kt; do if [ -f "$f" ]; then cp "$f" "$K/"; fi; done
+          if [ -f AndroidManifest.xml ]; then cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml; fi
+          flutter pub get
+
+      - name: Build APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IRA-Service-Desk-Flutter-APK
+          path: '**/build/app/outputs/flutter-apk/app-release.apk'
