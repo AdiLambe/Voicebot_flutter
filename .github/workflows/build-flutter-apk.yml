@@ -44,6 +44,9 @@ jobs:
           for f in main.dart core.dart phone.dart; do if [ -f "$f" ]; then cp "$f" lib/; fi; done
           for f in MainActivity.kt CallReceiver.kt; do if [ -f "$f" ]; then cp "$f" "$K/"; fi; done
           if [ -f AndroidManifest.xml ]; then cp AndroidManifest.xml android/app/src/main/AndroidManifest.xml; fi
+          sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 37/' android/app/build.gradle.kts 2>/dev/null || true
+          sed -i 's/compileSdk flutter.compileSdkVersion/compileSdk 37/' android/app/build.gradle 2>/dev/null || true
+          grep -n "compileSdk" android/app/build.gradle* || true
           flutter pub get
 
       - name: Build APK
