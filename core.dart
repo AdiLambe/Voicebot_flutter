@@ -55,6 +55,10 @@ const defaultConfig = <String, String>{
   'stt_language': 'en_IN',
   'voice_pitch': '0.7', // 0.7 = male awaaz, 1.0 = normal
   'voice_rate': '0.45',
+  // Asli call: har sawaal ke baad client ko jawab dene ke liye kitne second
+  'answer_wait': '20',
+  // Asli call par live text sunna (mic aapki awaaz pakadta hai, isliye default off)
+  'live_stt_real': 'off',
 };
 
 class Ticket {
@@ -64,6 +68,10 @@ class Ticket {
   DateTime createdAt, updatedAt;
   DateTime? completedAt;
   List<Map<String, dynamic>> history;
+
+  /// Call recording ki file (asli call par) aur har sawaal kis second par pucha gaya
+  String? recording;
+  List<Map<String, dynamic>> marks;
 
   Ticket({
     required this.id,
@@ -79,7 +87,10 @@ class Ticket {
     required this.updatedAt,
     this.completedAt,
     List<Map<String, dynamic>>? history,
-  }) : history = history ?? [];
+    this.recording,
+    List<Map<String, dynamic>>? marks,
+  }) : history = history ?? [],
+       marks = marks ?? [];
 
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -95,6 +106,8 @@ class Ticket {
     'updated_at': updatedAt.millisecondsSinceEpoch,
     'completed_at': completedAt?.millisecondsSinceEpoch,
     'history': history,
+    'recording': recording,
+    'marks': marks,
   };
 
   static Ticket fromJson(Map<String, dynamic> j) => Ticket(
@@ -113,6 +126,10 @@ class Ticket {
         ? null
         : DateTime.fromMillisecondsSinceEpoch(j['completed_at']),
     history: (j['history'] as List? ?? [])
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList(),
+    recording: j['recording'],
+    marks: (j['marks'] as List? ?? [])
         .map((e) => Map<String, dynamic>.from(e))
         .toList(),
   );
@@ -168,8 +185,10 @@ class Store {
 
   Future<Ticket> createTicket(
     Map<String, String> answers,
-    String callerNumber,
-  ) async {
+    String callerNumber, {
+    String? recording,
+    List<Map<String, dynamic>>? marks,
+  }) async {
     final next = (prefs.getInt(_kLastId) ?? 0) + 1;
     await prefs.setInt(_kLastId, next);
     final now = DateTime.now();
@@ -185,6 +204,8 @@ class Store {
       history: [
         {'status': 'open', 'at': now.millisecondsSinceEpoch},
       ],
+      recording: recording,
+      marks: marks,
     );
     tickets.insert(0, t);
     await save();

@@ -76,7 +76,9 @@ class Voice {
       await _tts.stop().timeout(const Duration(seconds: 2));
     } catch (_) {}
     try {
-      if (_stt.isListening) await _stt.cancel().timeout(const Duration(seconds: 2));
+      if (_stt.isListening) {
+        await _stt.cancel().timeout(const Duration(seconds: 2));
+      }
     } catch (_) {}
   }
 
@@ -146,4 +148,24 @@ class Phone {
   static Future<bool> end() async => (await _call<bool>('end')) ?? !isAndroid;
   static Future<void> speaker(bool on) => _call('speaker', on);
   static Future<void> toBack() => _call('toBack');
+
+  // ---------- call recording ----------
+  /// Recording shuru. Return: file path (null = recording nahi chali)
+  static Future<String?> recStart() => _call<String>('recStart');
+
+  /// Recording band. Return: final file path
+  static Future<String?> recStop() => _call<String>('recStop');
+
+  /// Abhi kaunsi file/source chal raha hai (source badal sakta hai agar pehla khamosh tha)
+  static Future<String?> recPath() => _call<String>('recPath');
+  static Future<String?> recSource() => _call<String>('recSource');
+
+  static Future<bool> play(String path, {int ms = 0}) async =>
+      (await _call<bool>('play', {'path': path, 'ms': ms})) ?? false;
+  static Future<void> stopPlay() => _call('stopPlay');
+
+  /// "IRA Call Recorder" accessibility service on hai?
+  static Future<bool> recorderEnabled() async =>
+      (await _call<bool>('recorderEnabled')) ?? !isAndroid;
+  static Future<void> openAccessibility() => _call('openAccessibility');
 }

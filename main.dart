@@ -82,6 +82,26 @@ class AppState extends ChangeNotifier {
   final demoNumberCtl = TextEditingController();
 
   Timer? _timer;
+
+  // ---- call recording (asli call) ----
+  String? recPath; // null = recording nahi chal rahi
+  String recSource = '';
+  DateTime? recStart;
+  final List<Map<String, dynamic>> marks = [];
+  int waitLeft = 0; // client ke jawab ka countdown
+
+  int get recSeconds =>
+      recStart == null ? 0 : DateTime.now().difference(recStart!).inSeconds;
+  bool get liveSttOnRealCall => store.cfg('live_stt_real') == 'on';
+
+  void _mark(String label) => marks.add({'label': label, 'sec': recSeconds});
+
+  Future<void> _stopRecording() async {
+    if (recPath == null) return;
+    final p = await Phone.recStop();
+    if (p != null) recPath = p;
+  }
+
   int _gen = 0; // purane async kaam cancel karne ke liye
   int _lastCallTs = 0;
 
@@ -203,11 +223,27 @@ class AppState extends ChangeNotifier {
       notifyListeners();
     });
     notifyListeners();
+    marks.clear();
+    recPath = null;
+    recStart = null;
     if (real) {
       await Phone.answer();
       await Future.delayed(const Duration(milliseconds: 1200));
-      await Phone.speaker(true); // bot ki awaaz customer tak speaker se
+      await Phone.speaker(
+        true,
+      ); // bot ki awaaz customer tak speaker se, aur mic client ko sun sake
       await Future.delayed(const Duration(milliseconds: 800));
+      // poori call record karo
+      if (!await Phone.recorderEnabled()) {
+        toast('Recording ke liye Setup mein "IRA Call Recorder" ON karo');
+      }
+      recPath = await Phone.recStart();
+      if (recPath != null) {
+        recStart = DateTime.now();
+        recSource = await Phone.recSource() ?? '';
+      } else {
+        toast('Call recording start nahi hui');
+      }
     } else {
       await Future.delayed(const Duration(milliseconds: 400));
     }
@@ -223,9 +259,29 @@ class AppState extends ChangeNotifier {
     stateText = 'Bot bol raha hai...  (${step + 1}/${questions.length})';
     heardText = '';
     notifyListeners();
+    if (!retry) _mark(q.label);
     await say(retry ? sorryMessage : q.text);
     if (gen != _gen || mode != Mode.bot) return;
-    await listen(gen);
+    if (real && !liveSttOnRealCall) {
+      await _waitForClient(gen);
+    } else {
+      await listen(gen);
+    }
+  }
+
+  /// Asli call: mic aapki awaaz pakadta hai, isliye sunke likhne ki jagah
+  /// client ko jawab dene ka time do (recording chal rahi hai), phir agla sawaal.
+  Future<void> _waitForClient(int gen) async {
+    waitLeft = int.tryParse(store.cfg('answer_wait')) ?? 20;
+    while (waitLeft > 0) {
+      stateText =
+          'Client jawab de raha hai... ${waitLeft}s  (recording chal rahi hai)';
+      notifyListeners();
+      await Future.delayed(const Duration(seconds: 1));
+      if (gen != _gen || mode != Mode.bot) return;
+      waitLeft--;
+    }
+    nextQ();
   }
 
   Future<void> listen([int? gen]) async {
@@ -279,7 +335,18 @@ class AppState extends ChangeNotifier {
     step = questions.length;
     final answers = {for (final e in inputs.entries) e.key: e.value.text};
     stateText = 'Ticket ban gaya';
-    final t = await store.createTicket(answers, callerCtl.text);
+    if (recPath != null) {
+      recPath =
+          await Phone.recPath() ?? recPath; // source badla ho toh naya path
+    }
+    if (hungUp) await _stopRecording();
+    if (!hungUp && recStart != null) _mark('Final message');
+    final t = await store.createTicket(
+      answers,
+      callerCtl.text,
+      recording: recPath,
+      marks: List.of(marks),
+    );
     toast('Ticket ${t.id} ban gaya (Open)');
     if (!hungUp) {
       questionText = '"$finalMessage"';
@@ -289,13 +356,22 @@ class AppState extends ChangeNotifier {
         await Future.delayed(const Duration(seconds: 1));
         await Phone.end(); // bot ke baad call khud kaat do
         await Phone.speaker(false);
+        await _stopRecording();
+        final p = recPath;
+        if (p != null && t.recording != p) {
+          t.recording = p;
+          await store.touch(t);
+        }
       }
     }
+    recStart = null;
     mode = Mode.idle;
     openTicket(t.id);
   }
 
   Future<void> endWithoutTicket() async {
+    await _stopRecording();
+    recStart = null;
     if (real) {
       await Phone.end();
       await Phone.speaker(false);
@@ -338,6 +414,33 @@ class AppState extends ChangeNotifier {
 
   Future<void> callBack(Ticket t) =>
       launchUrl(Uri(scheme: 'tel', path: t.callerNumber.replaceAll(' ', '')));
+
+  String? playing; // abhi kaunsi recording chal rahi hai
+
+  Future<void> playRecording(Ticket t, [int sec = 0]) async {
+    if (t.recording == null) return;
+    final ok = await Phone.play(t.recording!, ms: sec * 1000);
+    playing = ok ? t.id : null;
+    if (!ok) toast('Recording file nahi chali');
+    notifyListeners();
+  }
+
+  Future<void> stopPlayback() async {
+    await Phone.stopPlay();
+    playing = null;
+    notifyListeners();
+  }
+
+  Future<void> editTicket(Ticket t, Map<String, String> v) async {
+    t.roName = v['ro_name'] ?? t.roName;
+    t.address = v['address'] ?? t.address;
+    t.location = v['location'] ?? t.location;
+    t.problem = v['problem'] ?? t.problem;
+    t.callerNumber = v['caller'] ?? t.callerNumber;
+    await store.touch(t);
+    toast('Ticket update ho gaya');
+    notifyListeners();
+  }
 
   Future<void> deleteTicket(Ticket t) async {
     await store.delete(t.id);
@@ -866,11 +969,29 @@ class CallPage extends StatelessWidget {
       ],
     ),
     if (s.real)
-      const Padding(
-        padding: EdgeInsets.only(top: 8),
-        child: Text(
-          'Customer ki awaaz speaker pe aayegi. Mic na pakde toh jawab sunke yahan type karo aur Next dabao.',
-          style: TextStyle(color: muted, fontSize: 13),
+      Padding(
+        padding: const EdgeInsets.only(top: 10),
+        child: box(
+          color: s.recPath != null ? const Color(0xFF2A1215) : card,
+          borderColor: s.recPath != null ? red : border,
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Icon(
+                s.recPath != null ? Icons.fiber_manual_record : Icons.mic_off,
+                color: s.recPath != null ? red : muted,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  s.recPath != null
+                      ? 'REC ${(s.recSeconds ~/ 60).toString().padLeft(2, '0')}:${(s.recSeconds % 60).toString().padLeft(2, '0')}  \u2022  call record ho rahi hai (${s.recSource}). Aap chup raho.'
+                      : 'Recording band hai - Setup mein "IRA Call Recorder" ON karo.',
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     for (final q in questions) ...[
@@ -1084,6 +1205,79 @@ class DetailPage extends StatelessWidget {
           ],
         ),
       ),
+      const SizedBox(height: 10),
+      bigBtn(
+        'Edit details (recording sunke bharo)',
+        () => showDialog(
+          context: context,
+          builder: (_) => EditTicketDialog(s: s, t: t),
+        ),
+        color: card,
+        fg: Colors.white,
+        height: 46,
+        fontSize: 14,
+      ),
+      if (t.recording != null) ...[
+        const SizedBox(height: 14),
+        box(
+          borderColor: red,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'CALL RECORDING',
+                style: TextStyle(
+                  color: red,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 1,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: bigBtn(
+                      s.playing == t.id
+                          ? '\u25a0  Stop'
+                          : '\u25b6  Poori call suno',
+                      () => s.playing == t.id
+                          ? s.stopPlayback()
+                          : s.playRecording(t),
+                      color: s.playing == t.id ? red : green,
+                      fg: Colors.white,
+                      height: 46,
+                      fontSize: 14,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Har jawab yahan se suno:',
+                style: TextStyle(color: muted, fontSize: 12),
+              ),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  for (final m in t.marks)
+                    ActionChip(
+                      label: Text(
+                        '\u25b6 ${m['label']} (${(m['sec'] as int) ~/ 60}:${((m['sec'] as int) % 60).toString().padLeft(2, '0')})',
+                      ),
+                      onPressed: () => s.playRecording(t, m['sec'] as int),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              const Text(
+                'Copy: phone ke Music > IRA-Calls folder mein bhi hai.',
+                style: TextStyle(color: muted, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
       const SizedBox(height: 18),
       const Text(
         'Ticket stage (manual update)',
@@ -1195,6 +1389,8 @@ class _SettingsPageState extends State<SettingsPage> {
     ('stt_language', 'Sunne ki language (en_IN / hi_IN)', false),
     ('voice_pitch', 'Awaaz pitch (0.7 = male, 1.0 = female)', false),
     ('voice_rate', 'Bolne ki speed (0.3 slow - 0.6 fast)', false),
+    ('answer_wait', 'Asli call: client ke jawab ka time (seconds)', false),
+    ('live_stt_real', 'Asli call par live text (on/off) - off rakho', false),
   ];
   late final Map<String, TextEditingController> c = {
     for (final f in fields)
@@ -1270,7 +1466,7 @@ class SetupPage extends StatefulWidget {
 }
 
 class _SetupPageState extends State<SetupPage> {
-  bool phoneOk = !isAndroid, overlayOk = !isAndroid;
+  bool phoneOk = !isAndroid, overlayOk = !isAndroid, recorderOk = !isAndroid;
 
   @override
   void initState() {
@@ -1284,10 +1480,12 @@ class _SetupPageState extends State<SetupPage> {
         await Permission.phone.isGranted &&
         await Permission.microphone.isGranted;
     final o = await Permission.systemAlertWindow.isGranted;
+    final r = await Phone.recorderEnabled();
     if (mounted) {
       setState(() {
         phoneOk = p;
         overlayOk = o;
+        recorderOk = r;
       });
     }
   }
@@ -1346,7 +1544,7 @@ class _SetupPageState extends State<SetupPage> {
 
   @override
   Widget build(BuildContext context) => page([
-    header('SETUP', 'Asli call setup', 'Ek baar ye 3 step karo'),
+    header('SETUP', 'Asli call setup', 'Ek baar ye 4 step karo'),
     step(
       1,
       phoneOk,
@@ -1365,6 +1563,17 @@ class _SetupPageState extends State<SetupPage> {
     ),
     step(
       3,
+      recorderOk,
+      'Call recording: "IRA Call Recorder" ON',
+      'Accessibility > Downloaded apps / Installed services > IRA Call Recorder > ON. '
+          'Agar "Restricted setting" likha aaye: App info > upar 3 dots > "Allow restricted settings", phir dobara ON karo.',
+      'Accessibility kholo',
+      () async {
+        await Phone.openAccessibility();
+      },
+    ),
+    step(
+      4,
       false,
       'Xiaomi / Redmi / Poco ke liye',
       "App info > Autostart ON, Other permissions > 'Display pop-up windows while running in background' + "
@@ -1373,12 +1582,100 @@ class _SetupPageState extends State<SetupPage> {
       () => openAppSettings(),
     ),
     const Text(
-      'Note: Android kisi app ko call ke andar awaaz daalne nahi deta, isliye bot SPEAKER se bolta hai aur '
-      'customer ko phone ke mic se sunai deta hai. Phone shaant jagah rakho.',
+      'Note: Android normal apps ko call ki awaaz seedha nahi deta. Isliye bot SPEAKER on karke call record karta hai '
+      '(call-recorder apps jaisa). Bot ki call ke time aap chup raho aur phone shaant jagah rakho, '
+      'warna aapki awaaz bhi record hogi. Recording ticket mein milegi - sunke "Edit details" se bharo.',
       style: TextStyle(color: muted, fontSize: 13),
     ),
     if (kDebugMode) const SizedBox(height: 8),
   ]);
+}
+
+// =====================================================================
+//  Ticket edit (recording sunke details bharna)
+// =====================================================================
+class EditTicketDialog extends StatefulWidget {
+  const EditTicketDialog({super.key, required this.s, required this.t});
+  final AppState s;
+  final Ticket t;
+
+  @override
+  State<EditTicketDialog> createState() => _EditTicketDialogState();
+}
+
+class _EditTicketDialogState extends State<EditTicketDialog> {
+  late final c = {
+    'ro_name': TextEditingController(text: widget.t.roName),
+    'address': TextEditingController(text: widget.t.address),
+    'location': TextEditingController(text: widget.t.location),
+    'problem': TextEditingController(text: widget.t.problem),
+    'caller': TextEditingController(text: widget.t.callerNumber),
+  };
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    backgroundColor: card,
+    title: Text(
+      'Ticket #${widget.t.id}',
+      style: const TextStyle(color: Colors.white),
+    ),
+    content: SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (widget.t.recording != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Wrap(
+                spacing: 6,
+                children: [
+                  for (final m in widget.t.marks)
+                    ActionChip(
+                      label: Text('\u25b6 ${m['label']}'),
+                      onPressed: () =>
+                          widget.s.playRecording(widget.t, m['sec'] as int),
+                    ),
+                  ActionChip(
+                    label: const Text('\u25a0 Stop'),
+                    onPressed: widget.s.stopPlayback,
+                  ),
+                ],
+              ),
+            ),
+          label('RO name'),
+          field(c['ro_name']!, 'RO name'),
+          label('Address'),
+          field(c['address']!, 'Address', multiline: true),
+          label('Location'),
+          field(c['location']!, 'Location'),
+          label('Actual problem'),
+          field(c['problem']!, 'Actual problem', multiline: true),
+          label('Caller number'),
+          field(c['caller']!, '+91'),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(context),
+        child: const Text('Cancel'),
+      ),
+      TextButton(
+        onPressed: () {
+          widget.s.stopPlayback();
+          widget.s.editTicket(widget.t, {
+            for (final e in c.entries) e.key: e.value.text.trim(),
+          });
+          Navigator.pop(context);
+        },
+        child: const Text(
+          'Save',
+          style: TextStyle(color: yellow, fontWeight: FontWeight.w800),
+        ),
+      ),
+    ],
+  );
 }
 
 // =====================================================================
